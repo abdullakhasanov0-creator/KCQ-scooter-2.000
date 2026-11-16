@@ -1,0 +1,107 @@
+package com.kcqconnect.app.ble
+
+import android.annotation.SuppressLint
+import android.bluetooth.*
+import android.content.Context
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
+
+object KcqUuid {
+    val SERVICE: UUID = UUID.fromString("0000FFF0-0000-1000-8000-00805f9b34fb")
+    val WRITE: UUID = UUID.fromString("0000FFF6-0000-1000-8000-00805f9b34fb")
+    val NOTIFY: UUID = UUID.fromString("0000FFF7-0000-1000-8000-00805f9b34fb")
+    val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+}
+
+/** Запись в контроллер выключена, пока байты не проверены по логу официального приложения. */
+const val ALLOW_WRITE = false
+
+/** Подключение по BLE: сервис FFF0, запись в FFF6, уведомления от FFF7. Логи пишутся в [log]. */
+class KcqConnection(private val ctx: Context) {
+    private var gatt: BluetoothGatt? = null
+    private var writeChar: BluetoothGattCharacteristic? = null
+
+    private val _state = MutableStateFlow("DISCONNECTED")
+    val state: StateFlow<String> = _state.asStateFlow()
+
+    private val _log = MutableStateFlow<List<String>>(emptyList())
+    val log: StateFlow<List<String>> = _log.asStateFlow()
+
+    private fun add(s: String) {
+        _log.value = (_log.value + s).takeLast(300)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun connect(device: BluetoothDevice) {
+        disconnect()
+        _state.value = "CONNECTING"
+        add("connect ${device.address}")
+        gatt = device.connectGatt(ctx, false, callback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    @SuppressLint("MissingPermission")
+    fun disconnect() {
+        gatt?.disconnect()
+        gatt?.close()
+        gatt = null
+        writeChar = null
+        _state.value = "DISCONNECTED"
+    }
+
+    private val callback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
+        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                _state.value = "CONNECTED"
+                add("connected, discovering services")
+                g.discoverServices()
+            } else {
+                _state.value = "DISCONNECTED"
+                add("disconnected, status=$status")
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            add("services: " + g.services.joinToString { it.uuid.toString().substring(4, 8) })
+            val svc = g.getService(KcqUuid.SERVICE)
+            if (svc == null) {
+                add("FFF0 не найден: протокол не KCQ")
+                return
+            }
+            writeChar = svc.getCharacteristic(KcqUuid.WRITE)
+            val notify = svc.getCharacteristic(KcqUuid.NOTIFY)
+            if (notify == null) {
+                add("FFF7 не найден")
+                return
+            }
+            g.setCharacteristicNotification(notify, true)
+            notify.getDescriptor(KcqUuid.CCCD)?.let {
+                it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                g.writeDescriptor(it)
+            }
+            add("уведомления FFF7 включены")
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            add("RX " + value.joinToString(" ") { "%02X".format(it) })
+        }
+    }
+
+    /** Отправка сырого кадра. Работает только при ALLOW_WRITE = true. */
+    @SuppressLint("MissingPermission")
+    fun sendRaw(bytes: ByteArray): Boolean {
+        if (!ALLOW_WRITE) {
+            add("запись выключена (ALLOW_WRITE=false)")
+            return false
+        }
+        val g = gatt ?: return false
+        val c = writeChar ?: return false
+        c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        c.value = bytes
+        add("TX " + bytes.joinToString(" ") { "%02X".format(it) })
+        return g.writeCharacteristic(c)
+    }
+}
